@@ -38,7 +38,7 @@ DP-3  primary virtual, Plasma renders here, Sunshine captures
 - **KDE Plasma 6.6** or newer — `kscreen-doctor` with `mirror`, `addCustomMode`, `removeCustomMode` subcommands
 - NVIDIA or any GPU exposing at least one extra DRM connector you can force-activate via debugfs `edid_override` (typically HDMI or DisplayPort ports you're not using)
 - Python packages: `python3-evdev`, `python3-pyudev`, `python3-dbus`
-- `edid-decode`, `git`
+- `git`
 - **Sunshine with the `linux/kms` connector-name patch** — the installer
   writes a DRM connector name (e.g. `output_name = DP-2`) into
   `sunshine.conf`, which only resolves on a Sunshine build that includes
@@ -50,7 +50,7 @@ DP-3  primary virtual, Plasma renders here, Sunshine captures
 On Bazzite (rpm-ostree), first install deps:
 
 ```
-rpm-ostree install python3-evdev python3-pyudev python3-dbus edid-decode
+rpm-ostree install python3-evdev python3-pyudev python3-dbus
 sudo systemctl reboot
 ```
 
