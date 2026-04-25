@@ -1,0 +1,16 @@
+[Unit]
+Description=Sunshine emergency-stop hotkey daemon (Ctrl+Alt+Shift+Q)
+After=systemd-udevd.service multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/sunshine-hotkey-daemon.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Runs as root: needs read access to /dev/input and permission to exec the
+# emergency-stop helper which itself uses sudo to reach the user session.
+
+[Install]
+WantedBy=multi-user.target

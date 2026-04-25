@@ -1,0 +1,51 @@
+#!/bin/bash
+# Terminate any active Sunshine session, restore the physical display,
+# unlock the user session, and notify the user. Safe to run even if no
+# session is active — each step is idempotent.
+
+USER_NAME="{{USER_NAME}}"
+USER_UID="1000"
+SERVICE="app-dev.lizardbyte.app.Sunshine.service"
+TEARDOWN="/var/home/${USER_NAME}/.local/bin/sunshine-display-teardown.sh"
+INHIBIT_PID_FILE="/tmp/sunshine-sleep-inhibit.pid"
+
+AS_USER=(sudo -u "$USER_NAME"
+    "XDG_RUNTIME_DIR=/run/user/${USER_UID}"
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_UID}/bus")
+
+log() { logger -t sunshine-emergency-stop -- "$*"; echo "[sunshine-emergency-stop] $*"; }
+
+log "triggered"
+
+if [ -f "$INHIBIT_PID_FILE" ]; then
+    kill "$(cat "$INHIBIT_PID_FILE" 2>/dev/null)" 2>/dev/null
+    rm -f "$INHIBIT_PID_FILE"
+fi
+
+if [ -x "$TEARDOWN" ]; then
+    timeout 4s "${AS_USER[@]}" "$TEARDOWN" || log "teardown exited non-zero"
+fi
+
+if ! timeout 8s "${AS_USER[@]}" systemctl --user stop "$SERVICE"; then
+    "${AS_USER[@]}" systemctl --user kill --signal=SIGKILL "$SERVICE" 2>/dev/null || true
+    log "sunshine service killed after stop timeout"
+fi
+
+# Intentionally do NOT unlock the session — the lock screen must stay up for
+# security. Stopping Sunshine above already restores the physical monitor and
+# frees the physical keyboard, so the user can enter the password normally.
+
+# Notify. notify-send needs the user's D-Bus; fall back to a logger-only path
+# if the session bus isn't reachable (e.g. no one logged in).
+"${AS_USER[@]}" notify-send \
+    --app-name="Sunshine" \
+    --icon=computer \
+    --urgency=critical \
+    "Sunshine session ended" \
+    "Emergency stop (Ctrl+Alt+Shift+Q) — streaming stopped, display restored." \
+    2>/dev/null || log "notification skipped (no session bus)"
+
+# Restart Sunshine so the next Moonlight connect works without manual steps.
+"${AS_USER[@]}" systemctl --user start --no-block "$SERVICE" || log "restart failed"
+
+log "done"

@@ -1,0 +1,194 @@
+#!/bin/bash
+# Nuclear option: restore the display setup when the normal path is wedged.
+#
+# Intended to work even when the user's D-Bus session is broken and
+# kscreen-doctor calls via systemd-run hang / fail with "Connection
+# reset by peer". Operates primarily at the kernel (sysfs + debugfs)
+# level so it doesn't rely on anything user-space that may be dead.
+#
+# Fires on Ctrl+Alt+Shift+R via the hotkey daemon. Safe to run any time.
+
+set +e
+USER_NAME="{{USER_NAME}}"
+USER_UID="{{USER_UID}}"
+LOG_TAG="sunshine-emergency-reset"
+
+log() { logger -t "$LOG_TAG" -- "$*"; echo "[${LOG_TAG}] $*"; }
+
+# machinectl shell runs a minimal env — kscreen-doctor needs the
+# Wayland/KDE env explicitly, otherwise Qt falls back to xcb and
+# silently fails while returning 0.
+USER_ENV_EXPORTS="export XDG_RUNTIME_DIR=/run/user/${USER_UID:-{{USER_UID}}}; \
+                  export WAYLAND_DISPLAY=wayland-0; \
+                  export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_UID:-{{USER_UID}}}/bus; \
+                  export QT_QPA_PLATFORM=wayland; \
+                  export XDG_CURRENT_DESKTOP=KDE; \
+                  export KDE_FULL_SESSION=true; \
+                  export KDE_SESSION_VERSION=6;"
+
+log "triggered"
+
+# --- 1. Kill any stuck kscreen-doctor processes -----------------------------
+# If a previous invocation hung waiting on DBus, leftover processes can
+# block the user's systemd queue.
+pkill -9 -f 'kscreen-doctor'          2>/dev/null
+pkill -9 -f 'kscreen_backend_launcher' 2>/dev/null
+
+# --- 2. Clear all virtual-display EDID overrides and release forced status --
+# Find the GPU's debugfs dir dynamically so we don't hardcode the PCI slot.
+for DRI in /sys/kernel/debug/dri/*/; do
+    [ -d "$DRI" ] || continue
+    for OVR in "$DRI"*/edid_override; do
+        [ -f "$OVR" ] || continue
+        CONN_DIR=$(dirname "$OVR")
+        CONN_NAME=$(basename "$CONN_DIR")
+        # Only touch DP-*/HDMI-* — skip card0-* style non-connector entries.
+        case "$CONN_NAME" in DP-*|HDMI-*|DisplayPort-*|eDP-*) ;; *) continue ;; esac
+        # Clear any EDID override.
+        : > "$OVR" 2>/dev/null || echo reset > "$OVR" 2>/dev/null
+        # Release the forced-on status: if a previous session wrote "on",
+        # the connector stays permanently connected even without a cable.
+        STATUS_FILE=$(ls /sys/class/drm/card*-"$CONN_NAME"/status 2>/dev/null | head -1)
+        [ -n "$STATUS_FILE" ] || continue
+        # Skip the physical monitor (the one that has a real EDID we didn't inject).
+        EDID_FILE="$(dirname "$STATUS_FILE")/edid"
+        EDID_SIZE=$(stat -c%s "$EDID_FILE" 2>/dev/null)
+        if [ "$EDID_SIZE" -gt 0 ]; then
+            # Check whether this EDID came from us (product name matches) —
+            # crude: look for "Sunshine" or "UQD Virtual" in bytes.
+            if head -c 128 "$EDID_FILE" | grep -q -a -E "Sunshine|UQD"; then
+                log "releasing virtual $CONN_NAME"
+                echo off     > "$STATUS_FILE" 2>/dev/null
+                sleep 0.2
+                echo detect  > "$STATUS_FILE" 2>/dev/null
+            fi
+        else
+            # No EDID but may be in forced-on state with zero bytes — release it
+            # if something marked it connected without hardware.
+            if [ "$(cat "$STATUS_FILE" 2>/dev/null)" = "connected" ]; then
+                log "releasing forced-connected $CONN_NAME"
+                echo off    > "$STATUS_FILE" 2>/dev/null
+                sleep 0.2
+                echo detect > "$STATUS_FILE" 2>/dev/null
+            fi
+        fi
+    done
+done
+
+# --- 3. Clean state markers --------------------------------------------------
+rm -f /run/sunshine-virt-connector /run/sunshine-virt-fallback-connector 2>/dev/null
+
+# --- 4. Release any sleep inhibitor -----------------------------------------
+INHIBIT_PID_FILE="/tmp/sunshine-sleep-inhibit.pid"
+if [ -f "$INHIBIT_PID_FILE" ]; then
+    kill "$(cat "$INHIBIT_PID_FILE" 2>/dev/null)" 2>/dev/null
+    rm -f "$INHIBIT_PID_FILE"
+fi
+
+# --- 4b. Restore the baseline virtual display so Sunshine can capture -------
+# Without a connected virtual connector Sunshine fails with "Couldn't
+# find monitor [N]" on every connect. Inject a baseline 640x480 EDID
+# into the first available connector (preferring DP-3, falling back to
+# any DP-* / HDMI-*) so Sunshine has something to capture.
+VIRT_DIR="{{USER_HOME}}/.local/share/sunshine_virt_display"
+VIRT_DIR_RESOLVED="/var/home/${USER_NAME:-{{USER_NAME}}}/.local/share/sunshine_virt_display"
+[ -d "$VIRT_DIR_RESOLVED" ] || VIRT_DIR_RESOLVED="/home/${USER_NAME:-{{USER_NAME}}}/.local/share/sunshine_virt_display"
+if [ -d "$VIRT_DIR_RESOLVED" ]; then
+    TARGET=""
+    # Prefer DP-3 if its debugfs override file exists; otherwise first DP-*.
+    for cand in DP-3 DP-1 DP-2 HDMI-A-1; do
+        O=$(ls /sys/kernel/debug/dri/*/"$cand"/edid_override 2>/dev/null | head -1)
+        S=$(ls /sys/class/drm/card*-"$cand"/status 2>/dev/null | head -1)
+        # Skip the physical monitor (already has a real EDID).
+        EDID_F="$(dirname "$S" 2>/dev/null)/edid"
+        if [ -s "$EDID_F" ] && head -c 128 "$EDID_F" 2>/dev/null | grep -q -a -v -E "Sunshine|UQD"; then
+            continue
+        fi
+        if [ -n "$O" ] && [ -n "$S" ]; then
+            TARGET="$cand"
+            OVR="$O"
+            STF="$S"
+            break
+        fi
+    done
+    if [ -n "$TARGET" ]; then
+        log "re-activating virtual $TARGET with baseline EDID"
+        python3 -c "
+import sys
+sys.path.insert(0, '$VIRT_DIR_RESOLVED')
+from gen_edid import create_edid
+from pathlib import Path
+Path('$OVR').write_text('reset')
+Path('$OVR').write_bytes(create_edid(640, 480, 60, display_name='Sunshine Virt'))
+" 2>&1 | while read -r line; do log "gen_edid: $line"; done
+        echo off    > "$STF" 2>/dev/null
+        sleep 0.3
+        echo on     > "$STF" 2>/dev/null
+        sleep 0.5
+        # Record which connector is now the active virtual for the handler's
+        # subsequent connects.
+        echo "$TARGET" > /run/sunshine-virt-connector 2>/dev/null
+
+        # Position the virtual off-screen to the right so it has a CRTC
+        # but doesn't overlap the main desktop. Previous reset at default
+        # (0,0) overlapped DP-2 and visually destroyed the main view.
+        # Also re-pin DP-2 at (0,0) in case KScreen shuffled it.
+        # Best-effort — if KDE is too broken the sysfs kick above is still
+        # enough for Sunshine to find a capturable connector.
+        machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+            "$USER_ENV_EXPORTS kscreen-doctor output.$TARGET.enable output.$TARGET.mode.640x480@60 output.$TARGET.position.3440,0 output.DP-2.position.0,0" 2>/dev/null || \
+            log "kscreen-doctor positioning failed; virtual at default coords"
+    fi
+else
+    log "sunshine_virt_display lib not found at $VIRT_DIR_RESOLVED; skipping EDID inject"
+fi
+
+# --- 4c. Wait for KScreen to see the re-activated virtual -------------------
+# Sunshine's KMS scan only picks up the virtual if KScreen has assigned
+# it a CRTC. If we restart Sunshine too early ("Couldn't find monitor
+# [1]") it exits fatally. Poll up to 5s for KScreen to catch up.
+if [ -n "$TARGET" ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        OK=$(machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+             "$USER_ENV_EXPORTS kscreen-doctor -o 2>/dev/null | grep -cE 'Output.*$TARGET'")
+        [ "${OK:-0}" = "1" ] && break
+        sleep 0.5
+    done
+fi
+
+# --- 5. Hard-restart KScreen + Sunshine in the right order ------------------
+# If the user's KScreen DBus backend was wedged (common failure mode on
+# long Plasma sessions) refresh it before restarting Sunshine so the
+# monitor list is up-to-date.
+machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+    'systemctl --user restart plasma-kscreen.service' 2>/dev/null
+sleep 1
+
+# Restart Sunshine. If it fails (Fatal: Couldn't find monitor), retry
+# once after another pause to give KScreen time to settle.
+restart_sunshine() {
+    machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+        'systemctl --user restart app-dev.lizardbyte.app.Sunshine.service' 2>/dev/null
+}
+if restart_sunshine; then
+    log "sunshine restart requested"
+    sleep 3
+    if ! machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+          'systemctl --user is-active --quiet app-dev.lizardbyte.app.Sunshine.service'
+    then
+        log "sunshine failed to come up; retrying in 3s"
+        sleep 3
+        restart_sunshine
+    fi
+else
+    pkill -f '/usr/bin/sunshine' 2>/dev/null && log "sunshine killed directly"
+fi
+
+# --- 7. Notify ---------------------------------------------------------------
+machinectl shell --quiet --uid="$USER_UID" .host /bin/sh -c \
+    "notify-send --app-name=Sunshine --icon=computer --urgency=critical \
+        'Sunshine emergency reset' \
+        'Display topology reset to defaults. Stream stopped; reconnect to resume.'" \
+    2>/dev/null
+
+log "done"

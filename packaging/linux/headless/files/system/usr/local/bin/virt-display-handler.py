@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""Sunshine client connect/disconnect handler.
+
+On connect: sets an EDID matching the client's resolution on the Sunshine
+virtual DRM connector, and switches KScreen to that resolution. Does NOT
+touch physical monitors — that's the idle-daemon's job.
+
+On disconnect: restores the baseline 640x480 placeholder EDID and mode.
+
+Runs as root (needs to write to /sys/kernel/debug/dri/*/<conn>/edid_override).
+Calls kscreen-doctor in the user session via sudo.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Import the existing project's EDID generator as a library — we don't want
+# to reinvent EDID bytes.
+sys.path.insert(0, "/var/home/msteinberger/.local/share/sunshine_virt_display")
+from gen_edid import create_edid  # noqa: E402
+
+USER_NAME = "msteinberger"
+USER_UID = 1000
+VIRTUAL_EDID_NAME = "Sunshine Virt"  # must match idle-daemon VIRTUAL_EDID_RE
+# Baseline (idle) placeholder geometry
+BASELINE_W, BASELINE_H, BASELINE_R = 640, 480, 60
+# Note: position is NOT managed here — it's set once via kscreen-doctor and
+# persisted by KScreen to ~/.local/share/kscreen/. That keeps us free of
+# hardware-specific coordinates; the user can re-arrange displays in KDE
+# settings and this handler won't fight them.
+
+MARKER = Path("/run/sunshine-virt-connector")
+FALLBACK_MARKER = Path("/run/sunshine-virt-fallback-connector")
+
+
+def ensure_root():
+    if os.geteuid() != 0:
+        sys.exit("Error: must run as root")
+
+
+def find_virtual_connector() -> tuple[str, Path]:
+    """Return (connector_name, debugfs_override_path). Uses the marker file
+    if present; otherwise falls back to a detection heuristic."""
+    marked = None
+    try:
+        marked = MARKER.read_text().strip() or None
+    except OSError:
+        pass
+
+    candidates: list[tuple[str, Path]] = []
+    for drm in Path("/sys/class/drm").glob("card*-*"):
+        name_parts = drm.name.split("-", 1)
+        if len(name_parts) != 2:
+            continue
+        conn = name_parts[1]
+        try:
+            status = (drm / "status").read_text().strip()
+        except OSError:
+            continue
+        if status != "connected":
+            continue
+        try:
+            edid = (drm / "edid").read_bytes()
+        except OSError:
+            edid = b""
+        # Find the matching debugfs path
+        override = _find_override_path(conn)
+        if override is None:
+            continue
+        if marked == conn:
+            return conn, override
+        # Heuristic fallback: connected but no EDID OR EDID product name
+        # contains a virtual marker word.
+        is_virtual = not edid
+        if edid and _edid_looks_virtual(edid):
+            is_virtual = True
+        if is_virtual:
+            candidates.append((conn, override))
+
+    if not candidates:
+        sys.exit("No virtual connector found")
+    if len(candidates) > 1 and not marked:
+        print(f"  warning: multiple virtual candidates: {[c[0] for c in candidates]}; picking first", file=sys.stderr)
+    return candidates[0]
+
+
+def find_fallback_virtual_connector(primary_virtual: str) -> tuple[str, Path] | None:
+    """Find a second DRM connector we can use as a fallback virtual (a
+    replica of the primary virtual). Any currently-disconnected connector
+    with a debugfs edid_override file is a candidate. Returns None if no
+    candidate is available."""
+    # Prefer a previously-configured fallback from the marker file.
+    marked = None
+    try:
+        marked = FALLBACK_MARKER.read_text().strip() or None
+    except OSError:
+        pass
+
+    candidates: list[tuple[str, Path]] = []
+    for drm in Path("/sys/class/drm").glob("card*-*"):
+        parts = drm.name.split("-", 1)
+        if len(parts) != 2:
+            continue
+        conn = parts[1]
+        if conn == primary_virtual:
+            continue
+        try:
+            status = (drm / "status").read_text().strip()
+        except OSError:
+            continue
+        if status != "disconnected":
+            continue
+        override = _find_override_path(conn)
+        if override is None:
+            continue
+        if marked == conn:
+            return conn, override
+        candidates.append((conn, override))
+
+    if not candidates:
+        return None
+    # Prefer DisplayPort connectors (DP-*) over HDMI so the virtual-display
+    # layer stays on the same physical bus family as the primary virtual.
+    candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
+    return candidates[0]
+
+
+def activate_virtual_as_fallback(conn: str, override_path: Path, width: int, height: int, refresh: int) -> None:
+    """Inject an EDID override into `conn` and kick it so KWin picks it up
+    as a second virtual display we can use as a replica-fallback."""
+    edid = create_edid(width=width, height=height, refresh_rate=refresh, display_name=VIRTUAL_EDID_NAME)
+    write_override(override_path, edid)
+    kick_connector(conn)
+
+
+def deactivate_virtual(conn: str, override_path: Path) -> None:
+    """Undo activate_virtual_as_fallback: clear EDID override and *release*
+    the forced status so the connector goes back to its natural
+    (disconnected) state. kick_connector's final `on` write forces the
+    connector permanently connected, which is wrong on teardown — we
+    want "detect" (let the kernel auto-probe)."""
+    import time
+    # Clear any EDID override.
+    try:
+        override_path.write_text("reset")
+    except OSError:
+        pass
+    # Release the forced-on state: write "off" then "detect" so the kernel
+    # re-probes and settles on the real hardware state (no monitor = disconnected).
+    for drm in Path("/sys/class/drm").glob(f"card*-{conn}"):
+        status = drm / "status"
+        try:
+            status.write_text("off")
+            time.sleep(0.2)
+            status.write_text("detect")
+        except OSError as e:
+            print(f"  release status on {conn} failed: {e}", file=sys.stderr)
+        return
+
+
+def _find_override_path(conn: str) -> Path | None:
+    for dri in Path("/sys/kernel/debug/dri").glob("0000:*"):
+        p = dri / conn / "edid_override"
+        if p.exists():
+            return p
+    return None
+
+
+def _edid_looks_virtual(edid: bytes) -> bool:
+    # Copy of the idle-daemon's parse_edid_product_name, kept local so we
+    # don't have to share code paths.
+    if len(edid) < 128:
+        return False
+    for i in (54, 72, 90, 108):
+        d = edid[i:i + 18]
+        if len(d) == 18 and d[0:3] == b"\x00\x00\x00" and d[3] == 0xFC:
+            name = d[5:18].split(b"\x0a", 1)[0].decode("ascii", errors="replace").strip().lower()
+            if any(w in name for w in ("virtual", "uqd", "sunshine")):
+                return True
+    return False
+
+
+def write_override(override_path: Path, edid_bytes: bytes) -> None:
+    # "reset" first to make sure the kernel picks up the new bytes
+    try:
+        override_path.write_text("reset")
+    except OSError:
+        pass
+    override_path.write_bytes(edid_bytes)
+
+
+def kick_connector(conn: str) -> None:
+    """Force the kernel to re-read EDID and KWin to refresh its mode list
+    by cycling the connector off and on."""
+    import time
+    for drm in Path("/sys/class/drm").glob(f"card*-{conn}"):
+        status = drm / "status"
+        try:
+            status.write_text("off")
+        except OSError as e:
+            print(f"  connector off failed: {e}", file=sys.stderr)
+            return
+        time.sleep(0.3)
+        try:
+            status.write_text("on")
+        except OSError as e:
+            print(f"  connector on failed: {e}", file=sys.stderr)
+            return
+        time.sleep(0.5)
+        return
+
+
+def wait_for_mode(conn: str, width: int, height: int, timeout_s: float = 5.0) -> bool:
+    """Poll KScreen until it exposes the requested mode on `conn`. Returns
+    True if the mode shows up in time, False otherwise."""
+    import time
+    try:
+        import dbus
+    except ImportError:
+        print("  dbus module missing — cannot verify mode exposure", file=sys.stderr)
+        time.sleep(1.5)
+        return False
+    bus = dbus.SessionBus()
+    proxy = bus.get_object("org.kde.KScreen", "/backend")
+    iface = dbus.Interface(proxy, "org.kde.kscreen.Backend")
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            cfg = iface.getConfig()
+        except Exception:
+            time.sleep(0.2)
+            continue
+        for out in cfg["outputs"]:
+            if str(out.get("name")) != conn:
+                continue
+            for m in out.get("modes", []):
+                sz = m.get("size", {})
+                if int(sz.get("width", 0)) == width and int(sz.get("height", 0)) == height:
+                    return True
+        time.sleep(0.2)
+    return False
+
+
+def as_user(*cmd: str) -> subprocess.CompletedProcess:
+    # systemd-run drops into the user's systemd-managed scope, inheriting
+    # the full KDE/Wayland/D-Bus environment — kscreen-doctor won't see a
+    # stripped env the way runuser or sudo -u would give it.
+    return subprocess.run(
+        [
+            "systemd-run",
+            f"--machine={USER_NAME}@.host",
+            "--user", "--pipe", "--quiet", "--wait",
+            *cmd,
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+
+
+def apply_mode(conn: str, w: int, h: int, r: int) -> None:
+    r_cmd = as_user("kscreen-doctor", f"output.{conn}.mode.{w}x{h}@{r}")
+    if r_cmd.returncode != 0:
+        print(f"  kscreen mode change failed: {r_cmd.stderr.strip()}", file=sys.stderr)
+
+
+def apply_enable(conn: str) -> None:
+    as_user("kscreen-doctor", f"output.{conn}.enable")
+
+
+def apply_mirror(target: str, source: str) -> None:
+    """Make `target` display replicate `source`. source='none' disables mirror."""
+    r = as_user("kscreen-doctor", f"output.{target}.mirror.{source}")
+    if r.returncode != 0:
+        print(f"  kscreen mirror {target}<-{source} failed: {r.stderr.strip()}", file=sys.stderr)
+
+
+def list_physical_connectors(virtual: str) -> list[str]:
+    """Every connected connector that isn't the virtual one and has an
+    EDID whose product name doesn't look virtual."""
+    out = []
+    for drm in Path("/sys/class/drm").glob("card*-*"):
+        parts = drm.name.split("-", 1)
+        if len(parts) != 2:
+            continue
+        conn = parts[1]
+        if conn == virtual:
+            continue
+        try:
+            if (drm / "status").read_text().strip() != "connected":
+                continue
+            edid = (drm / "edid").read_bytes()
+        except OSError:
+            continue
+        if not edid or _edid_looks_virtual(edid):
+            continue
+        out.append(conn)
+    return out
+
+
+def _output_has_size(conn: str, width: int, height: int, timeout_s: float = 2.0) -> bool:
+    """True iff KScreen reports `conn` at the given size (with brief retry —
+    setConfig is applied asynchronously by KWin)."""
+    import time
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        proxy = bus.get_object("org.kde.KScreen", "/backend")
+        iface = dbus.Interface(proxy, "org.kde.kscreen.Backend")
+    except Exception:
+        return False
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            cfg = iface.getConfig()
+        except Exception:
+            cfg = None
+        if cfg:
+            for out in cfg["outputs"]:
+                if str(out.get("name")) != conn:
+                    continue
+                sz = out.get("size", {})
+                if int(sz.get("width", 0)) == width and int(sz.get("height", 0)) == height:
+                    return True
+                break
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def cleanup_custom_modes(conn: str) -> None:
+    """Remove all custom modes from `conn` by running removeCustomMode.0
+    repeatedly until it no longer succeeds. Prevents mode-pool bloat across
+    repeated connect/disconnect cycles."""
+    for _ in range(50):  # hard cap to avoid infinite loop
+        r = as_user("kscreen-doctor", f"output.{conn}.removeCustomMode.0")
+        if r.returncode != 0:
+            break
+        out = (r.stdout or "") + (r.stderr or "")
+        if "out of range" in out.lower() or not out.strip():
+            # Either nothing to remove, or we removed something with empty output —
+            # keep going until non-zero return.
+            if "out of range" in out.lower() or "no" in out.lower():
+                break
+
+
+def _output_already_has_mode(conn: str, width: int, height: int) -> bool:
+    """True if `conn` already has a mode with the given resolution in its
+    mode list (native or previously-added custom)."""
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        proxy = bus.get_object("org.kde.KScreen", "/backend")
+        iface = dbus.Interface(proxy, "org.kde.kscreen.Backend")
+        cfg = iface.getConfig()
+    except Exception:
+        return False
+    for out in cfg["outputs"]:
+        if str(out.get("name")) != conn:
+            continue
+        for m in out.get("modes", []):
+            sz = m.get("size", {})
+            if int(sz.get("width", 0)) == width and int(sz.get("height", 0)) == height:
+                return True
+    return False
+
+
+def get_preferred_mode_name(conn: str) -> str | None:
+    """Return the '<W>x<H>@<R>' string for the preferred mode of conn (its
+    native/default resolution), or None on failure. Runs the DBus query in
+    the user's session via systemd-run — root can't reach the user's
+    session bus directly."""
+    script = (
+        "import dbus; "
+        "cfg = dbus.Interface(dbus.SessionBus().get_object('org.kde.KScreen','/backend'),"
+        "'org.kde.kscreen.Backend').getConfig(); "
+        f"out = next((o for o in cfg['outputs'] if str(o['name'])=={conn!r}), None); "
+        "prefs = [str(p) for p in (out.get('preferredModes', []) if out else [])]; "
+        "pid = prefs[0] if prefs else ''; "
+        "name = next((str(m.get('name','')) for m in (out.get('modes', []) if out else []) if str(m.get('id'))==pid), ''); "
+        "print(name)"
+    )
+    try:
+        r = subprocess.run(
+            ["systemd-run", f"--machine={USER_NAME}@.host",
+             "--user", "--pipe", "--quiet", "--wait",
+             "python3", "-c", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        name = r.stdout.strip() if r.returncode == 0 else ""
+        if name:
+            return name
+    except Exception as e:
+        print(f"  DBus preferred-mode query failed: {e}", file=sys.stderr)
+
+    # Fallback: parse `kscreen-doctor -o`. The preferred mode is marked
+    # with a trailing "!" in the Modes list. Survives KScreen DBus decay.
+    try:
+        r = as_user("kscreen-doctor", "-o")
+        if r.returncode != 0 or not r.stdout:
+            return None
+        import re
+        text = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", r.stdout)
+        in_block = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Output:"):
+                in_block = (f" {conn} " in line) or line.rstrip().endswith(f" {conn}")
+                continue
+            if in_block and "Modes:" in line:
+                for m in re.finditer(r"\d+:(\d+x\d+@\d+(?:\.\d+)?)(!)?", line):
+                    if m.group(2) == "!":
+                        mode_full = m.group(1)
+                        w_h, _, rate = mode_full.partition("@")
+                        try:
+                            rate_int = int(round(float(rate)))
+                        except ValueError:
+                            rate_int = rate
+                        return f"{w_h}@{rate_int}"
+                break
+    except Exception as e:
+        print(f"  kscreen-doctor preferred-mode fallback failed: {e}", file=sys.stderr)
+    return None
+
+
+def get_primary_physical_connector(virtual: str) -> str | None:
+    """The main monitor — the physical (non-virtual) connector KScreen marks
+    as priority 1. Falls back to the first physical if KScreen can't be
+    reached or no priority=1 output exists."""
+    physicals = set(list_physical_connectors(virtual))
+    if not physicals:
+        return None
+    try:
+        import dbus
+        bus = dbus.SessionBus()
+        proxy = bus.get_object("org.kde.KScreen", "/backend")
+        iface = dbus.Interface(proxy, "org.kde.kscreen.Backend")
+        cfg = iface.getConfig()
+    except Exception as e:
+        print(f"  KScreen query failed ({e}); using first physical", file=sys.stderr)
+        return sorted(physicals)[0]
+
+    best = None
+    best_prio = None
+    for out in cfg["outputs"]:
+        name = str(out.get("name", ""))
+        if name not in physicals:
+            continue
+        if not bool(out.get("connected", False)):
+            continue
+        prio = int(out.get("priority", 999))
+        if best_prio is None or prio < best_prio:
+            best = name
+            best_prio = prio
+    return best or sorted(physicals)[0]
+
+
+def cmd_connect(args):
+    ensure_root()
+    conn, override = find_virtual_connector()
+    print(f"connect: virtual connector = {conn}")
+    MARKER.write_text(conn)
+
+    edid = create_edid(
+        width=args.width,
+        height=args.height,
+        refresh_rate=args.refresh,
+        display_name=VIRTUAL_EDID_NAME,
+    )
+    write_override(override, edid)
+    print(f"  EDID override written ({len(edid)} bytes) at {args.width}x{args.height}@{args.refresh}")
+    kick_connector(conn)
+    ok = wait_for_mode(conn, args.width, args.height)
+    print(f"  connector kicked, mode exposed = {ok}")
+
+    # Also activate a second (fallback) virtual connector with the same EDID.
+    # It exists solely so KWin keeps rendering when the primary physical
+    # monitor is disabled for idle — KWin stops rendering the Plasma
+    # compositor entirely if the only enabled output is one single output
+    # that's a replica source. Having two virtual outputs (primary + replica)
+    # satisfies its internal precondition.
+    fallback = find_fallback_virtual_connector(primary_virtual=conn)
+    fallback_conn = None
+    if fallback is not None:
+        fallback_conn, fb_override = fallback
+        activate_virtual_as_fallback(fallback_conn, fb_override, args.width, args.height, args.refresh)
+        FALLBACK_MARKER.write_text(fallback_conn)
+        print(f"  fallback virtual activated: {fallback_conn}")
+
+    # Preferred layout: both the primary physical monitor AND the virtual
+    # sit at the client resolution at position (0,0). That's an implicit
+    # clone — KWin renders one workspace and both outputs scan it out.
+    # The physical monitor's driver may reject exotic timings (unusual
+    # aspect ratios, square resolutions, etc.); in that case we fall back
+    # to the virtual replicating the primary (scaled full-desktop view).
+    main = get_primary_physical_connector(virtual=conn)
+    mode = f"{args.width}x{args.height}@{args.refresh}"
+    applied_clone = False
+
+    # New topology: virtual is primary (priority 1), the fallback virtual and
+    # the physical monitor both become replicas of it. This lets the idle
+    # daemon disable the physical monitor without killing the stream — the
+    # fallback virtual keeps KWin rendering.
+    if fallback_conn:
+        topo_args = [
+            f"output.{conn}.priority.1",
+            f"output.{conn}.enable",
+            f"output.{conn}.mode.{mode}",
+            f"output.{conn}.position.0,0",
+            f"output.{fallback_conn}.priority.2",
+            f"output.{fallback_conn}.enable",
+            f"output.{fallback_conn}.mode.{mode}",
+            f"output.{fallback_conn}.position.0,0",
+            f"output.{fallback_conn}.mirror.{conn}",
+        ]
+        if main:
+            topo_args.extend([
+                f"output.{main}.priority.3",
+                f"output.{main}.enable",
+                f"output.{main}.position.0,0",
+                f"output.{main}.mirror.{conn}",
+            ])
+        r = as_user("kscreen-doctor", *topo_args)
+        if r.returncode != 0:
+            print(f"  topology apply returned rc={r.returncode}: {r.stderr.strip()}",
+                  file=sys.stderr)
+        print(f"  topology: {conn} primary, {fallback_conn} and {main} replicas")
+        print("connect: done")
+        return
+    # Legacy single-virtual fallback path (no DP-1 second virtual available)
+    if main:
+        # Step 1: get DP-3 into the client mode separately. Mixing DP-3
+        # enable/mode commands with DP-2 mode in one batch triggers the
+        # driver's "rejected output configuration" response.
+        pre = as_user("kscreen-doctor",
+                     f"output.{conn}.enable",
+                     f"output.{conn}.mode.{mode}",
+                     f"output.{conn}.position.0,0")
+        if pre.returncode != 0:
+            print(f"  virtual pre-config failed: {pre.stderr.strip()}", file=sys.stderr)
+
+        # Step 2: register custom mode on the primary + put it in clone mode
+        # with DP-3. Driver requires addCustomMode for the target resolution
+        # even if it's in the EDID.
+        # Custom mode timing: ".full" = standard CVT blanking (stretches to
+        # fill panel). Required suffix per Plasma 6.6 syntax; omitting it
+        # can cause silent driver rejection.
+        clone_args = [
+            f"output.{main}.addCustomMode.{args.width}.{args.height}.{args.refresh * 1000}.full",
+            f"output.{main}.mirror.none",
+            f"output.{conn}.mirror.none",
+            f"output.{main}.mode.{mode}",
+            f"output.{main}.position.0,0",
+        ]
+        r = as_user("kscreen-doctor", *clone_args)
+        # Also mirror DP-3 to DP-2 unconditionally — if the clone batch
+        # succeeded, both ends up at client res and the replica binding is a
+        # harmless no-op (same content either way); if the driver silently
+        # kept DP-2 at its native mode, the mirror gives us a scaled replica
+        # as fallback so the user still sees identical content on both.
+        if r.returncode != 0:
+            print(f"  clone apply returned rc={r.returncode}: {r.stderr.strip()}", file=sys.stderr)
+        applied_clone = _output_has_size(main, args.width, args.height)
+        if applied_clone:
+            print(f"  clone: {main} and {conn} both at {mode}")
+        else:
+            print(f"  clone rejected by driver, using scaled replica fallback")
+
+    if True:  # always also set the mirror for visual equivalence
+        # Bind virtual as replica of primary. If clone already succeeded
+        # this is a no-op (same content either way). If it didn't, this
+        # gives a scaled-replica so both outputs show identical content.
+        mirror_args = [
+            f"output.{conn}.enable",
+            f"output.{conn}.mode.{mode}",
+            f"output.{conn}.position.0,0",
+        ]
+        if main:
+            mirror_args.append(f"output.{main}.mirror.none")
+            mirror_args.append(f"output.{conn}.mirror.{main}")
+        r = as_user("kscreen-doctor", *mirror_args)
+        if r.returncode != 0:
+            print(f"  mirror apply failed: {r.stderr.strip()}", file=sys.stderr)
+    print("connect: done")
+
+
+def cmd_disconnect(args):
+    ensure_root()
+    conn, override = find_virtual_connector()
+    print(f"disconnect: virtual connector = {conn}")
+
+    # Read the fallback virtual marker (set at connect time).
+    fb_conn = None
+    try:
+        fb_conn = FALLBACK_MARKER.read_text().strip() or None
+    except OSError:
+        pass
+
+    # First break ALL replica bindings — disabling a replica's source while
+    # the binding is still set triggers the KScreen "negative position" bug.
+    #
+    # For the primary physical monitor we additionally restore native mode
+    # and priority — BUT only if it is currently enabled. If the idle
+    # daemon disabled it (user walked away and is still away), leave it
+    # in that state so the stream ending doesn't wake the LG back up just
+    # to immediately cycle it off again.
+    main = get_primary_physical_connector(virtual=conn)
+    main_is_enabled = False
+    if main:
+        for drm in Path("/sys/class/drm").glob(f"card*-{main}"):
+            try:
+                main_is_enabled = (drm / "enabled").read_text().strip() == "enabled"
+            except OSError:
+                pass
+            break
+
+    unmirror_args = [f"output.{conn}.mirror.none"]
+    if fb_conn:
+        unmirror_args.append(f"output.{fb_conn}.mirror.none")
+    if main and main_is_enabled:
+        # DP-2 was on during the stream — restore it to native now.
+        unmirror_args.append(f"output.{main}.mirror.none")
+        preferred = get_preferred_mode_name(main)
+        if preferred:
+            unmirror_args.append(f"output.{main}.priority.1")
+            unmirror_args.append(f"output.{main}.mode.{preferred}")
+    # IMPORTANT: if DP-2 was idle-off we intentionally do NOT include it
+    # in the kscreen-doctor batch at all. Sending ANY command targeting
+    # a disabled output (even `mirror.none`) causes KWin to re-enable it
+    # as a side effect of the layout re-evaluation — which defeats the
+    # whole "leave idle-off alone" policy.
+    r = as_user("kscreen-doctor", *unmirror_args)
+    if r.returncode != 0:
+        print(f"  restore apply failed: {r.stderr.strip()}", file=sys.stderr)
+    elif main_is_enabled:
+        print(f"  restored: {main} -> native, mirrors cleared")
+    else:
+        print(f"  {main} was idle-off; left disabled (skipped kscreen command entirely)")
+
+    # Tear down the fallback virtual connector entirely.
+    if fb_conn:
+        as_user("kscreen-doctor", f"output.{fb_conn}.disable")
+        fb_override = _find_override_path(fb_conn)
+        if fb_override is not None:
+            deactivate_virtual(fb_conn, fb_override)
+        try:
+            FALLBACK_MARKER.unlink()
+        except OSError:
+            pass
+        print(f"  fallback virtual {fb_conn} torn down")
+
+    # Clean up accumulated custom modes on the primary — they accumulate
+    # across connect/disconnect cycles and eventually confuse the driver's
+    # mode matcher, leading to silent rejection of new clone attempts.
+    if main:
+        cleanup_custom_modes(main)
+
+    edid = create_edid(
+        width=BASELINE_W,
+        height=BASELINE_H,
+        refresh_rate=BASELINE_R,
+        display_name=VIRTUAL_EDID_NAME,
+    )
+    write_override(override, edid)
+    print(f"  baseline EDID restored ({BASELINE_W}x{BASELINE_H}@{BASELINE_R})")
+    kick_connector(conn)
+    ok = wait_for_mode(conn, BASELINE_W, BASELINE_H)
+    print(f"  connector kicked, mode exposed = {ok}")
+
+    r = as_user("kscreen-doctor",
+                f"output.{conn}.enable",
+                f"output.{conn}.mode.{BASELINE_W}x{BASELINE_H}@{BASELINE_R}")
+    if r.returncode != 0:
+        print(f"  kscreen baseline apply failed: {r.stderr.strip()}", file=sys.stderr)
+    print("disconnect: done")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("connect")
+    c.add_argument("--width", type=int, required=True)
+    c.add_argument("--height", type=int, required=True)
+    c.add_argument("--refresh", type=int, default=60)
+    c.set_defaults(func=cmd_connect)
+
+    d = sub.add_parser("disconnect")
+    d.set_defaults(func=cmd_disconnect)
+
+    args = ap.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
