@@ -948,7 +948,19 @@ editing the `conf` file in a text editor. Use the examples as reference.
             Info: Detected display: DP-1 (id: 3) connected: false
             Info: Detected display: DVI-D-1 (id: 4) connected: false
             @endcode
-            You need to use the id value inside the parenthesis, e.g. `1`.
+            You can use either the id value inside the parenthesis (e.g. `1`)
+            or, when the active capture backend is KMS, the DRM connector
+            name (e.g. `HDMI-A-1`, `DP-2`). Sunshine logs the active backend
+            on startup as `Screencasting with KMS` / `Screencasting with X11`
+            / `Screencasting with Wayland's protocol`; connector-name
+            output_name only resolves on the KMS path. On X11/Wayland/NvFBC
+            the value falls back to numeric-index matching.
+
+            Connector names are usually more stable than the numeric id when
+            the monitor enumeration order changes (e.g. when virtual displays
+            are added or physical monitors are powered off mid-session); the
+            connector name itself can still change if the kernel/driver
+            re-orders connector initialization.
             <br>
             <br>
             **macOS:**
@@ -1025,6 +1037,10 @@ editing the `conf` file in a text editor. Use the examples as reference.
         <td>Example (FreeBSD/Linux)</td>
         <td colspan="2">@code{}
             output_name = 0
+            @endcode
+            Or, on Linux KMS, by connector name:
+            @code{}
+            output_name = HDMI-A-1
             @endcode</td>
     </tr>
     <tr>

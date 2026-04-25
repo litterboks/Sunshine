@@ -3,9 +3,11 @@
  * @brief Definitions for video.
  */
 // standard includes
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cctype>
 #include <list>
 #include <thread>
 
@@ -1247,6 +1249,42 @@ namespace video {
           return;
         }
       }
+
+#if defined(SUNSHINE_BUILD_DRM)
+      // No string match. Fall back to interpreting a purely-numeric
+      // output_name as a direct index into display_names. Linux KMS emits
+      // DRM connector names ("DP-2") instead of numeric strings, but
+      // Sunshine still has to honor a legacy `output_name = 1` config.
+      //
+      // Gated by SUNSHINE_BUILD_DRM to leave Windows/macOS unchanged: their
+      // display_names entries are device-IDs (UUIDs / CGDirectDisplayIDs),
+      // and silently reinterpreting a numeric output_name as a list index
+      // there would change the meaning of misconfigured values.
+      //
+      // Anything wider than std::size_t can't be a valid list index, so a
+      // 20-digit cap is a safe upper bound that also keeps the manual
+      // accumulator below from wrapping (size_t max is at most 20 digits).
+      if (!output_name.empty() && output_name.size() <= 20 && std::all_of(output_name.begin(), output_name.end(), [](unsigned char c) {
+            return std::isdigit(c);
+          })) {
+        std::size_t idx = 0;
+        bool overflow = false;
+        for (char c : output_name) {
+          std::size_t next = idx * 10 + static_cast<std::size_t>(c - '0');
+          if (next < idx) {
+            overflow = true;
+            break;
+          }
+          idx = next;
+        }
+        if (overflow || idx >= display_names.size()) {
+          BOOST_LOG(warning) << "output_name '"sv << output_name
+                             << "' is out of range; falling back to display 0."sv;
+        } else {
+          current_display_index = static_cast<int>(idx);
+        }
+      }
+#endif
     }
   }
 

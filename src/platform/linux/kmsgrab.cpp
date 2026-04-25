@@ -3,11 +3,17 @@
  * @brief Definitions for KMS screen capture.
  */
 // standard includes
+#include <algorithm>
+#include <cctype>
 #include <errno.h>
 #include <fcntl.h>
 #include <filesystem>
+#include <limits>
+#include <optional>
+#include <set>
 #include <thread>
 #include <unistd.h>
+#include <variant>
 
 // platform includes
 #include <drm_fourcc.h>
@@ -177,6 +183,11 @@ namespace platf {
       std::uint32_t monitor_index;
 
       platf::touch_port_t viewport;
+
+      // True once kms_display_names() has bound this connector to an active
+      // fb plane. Distinguishes "connector enumerated but not currently
+      // capturable" from "matched a real, scanning monitor."
+      bool active;
     };
 
     struct card_descriptor_t {
@@ -187,7 +198,13 @@ namespace platf {
 
     static std::vector<card_descriptor_t> card_descriptors;
 
-    static std::uint32_t from_view(const std::string_view &string) {
+    // Pure connector-type lookup. Returns nullopt for unknown prefixes so
+    // callers receiving user input (e.g. parse_connector_name) can decide
+    // how to react without forcing a "report this to GitHub" log line.
+    //
+    // NOTE: when adding a new connector type here, also add a canonical
+    // name in to_string() below so kms_display_names() can round-trip it.
+    static std::optional<std::uint32_t> from_view_quiet(const std::string_view &string) {
 #define _CONVERT(x, y) \
   if (string == x) \
   return DRM_MODE_CONNECTOR_##y
@@ -229,6 +246,7 @@ namespace platf {
 #ifdef DRM_MODE_CONNECTOR_USB
       _CONVERT("USB"sv, USB);
 #endif
+#undef _CONVERT
 
       // If the string starts with "Unknown", it may have the raw type
       // value appended to the string. Let's try to read it.
@@ -240,8 +258,215 @@ namespace platf {
         }
       }
 
+      return std::nullopt;
+    }
+
+    static std::uint32_t from_view(const std::string_view &string) {
+      if (auto type = from_view_quiet(string)) {
+        return *type;
+      }
       BOOST_LOG(error) << "Unknown Monitor connector type ["sv << string << "]: Please report this to the GitHub issue tracker"sv;
       return DRM_MODE_CONNECTOR_Unknown;
+    }
+
+    // Inverse of from_view: returns a canonical libdrm-style connector name
+    // ("DP", "HDMI-A", "eDP", ...) for a known DRM_MODE_CONNECTOR_* type, and
+    // the kernel-style "Unknown<N>" placeholder for everything else (which
+    // from_view_quiet's Unknown%u branch round-trips back to the same
+    // numeric type). We don't call libdrm's drmModeGetConnectorTypeName
+    // directly because it's only available since libdrm 2.4.117.
+    static std::string to_string(std::uint32_t type) {
+      switch (type) {
+        case DRM_MODE_CONNECTOR_VGA:
+          return "VGA";
+        case DRM_MODE_CONNECTOR_DVII:
+          return "DVI-I";
+        case DRM_MODE_CONNECTOR_DVID:
+          return "DVI-D";
+        case DRM_MODE_CONNECTOR_DVIA:
+          return "DVI-A";
+        case DRM_MODE_CONNECTOR_Composite:
+          return "Composite";
+        case DRM_MODE_CONNECTOR_SVIDEO:
+          return "SVIDEO";
+        case DRM_MODE_CONNECTOR_LVDS:
+          return "LVDS";
+        case DRM_MODE_CONNECTOR_Component:
+          return "Component";
+        case DRM_MODE_CONNECTOR_9PinDIN:
+          return "DIN";
+        case DRM_MODE_CONNECTOR_DisplayPort:
+          return "DP";
+        case DRM_MODE_CONNECTOR_HDMIA:
+          return "HDMI-A";
+        case DRM_MODE_CONNECTOR_HDMIB:
+          return "HDMI-B";
+        case DRM_MODE_CONNECTOR_TV:
+          return "TV";
+        case DRM_MODE_CONNECTOR_eDP:
+          return "eDP";
+        case DRM_MODE_CONNECTOR_VIRTUAL:
+          return "Virtual";
+        case DRM_MODE_CONNECTOR_DSI:
+          return "DSI";
+        case DRM_MODE_CONNECTOR_DPI:
+          return "DPI";
+        case DRM_MODE_CONNECTOR_WRITEBACK:
+          return "Writeback";
+        case DRM_MODE_CONNECTOR_SPI:
+          return "SPI";
+#ifdef DRM_MODE_CONNECTOR_USB
+        case DRM_MODE_CONNECTOR_USB:
+          return "USB";
+#endif
+        default:
+          // Mirrors libdrm's own format; from_view_quiet's "Unknown%u" branch
+          // round-trips this back to the same numeric type.
+          return "Unknown" + std::to_string(type);
+      }
+    }
+
+    static bool is_all_digits(std::string_view s) {
+      return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) {
+        return std::isdigit(c);
+      });
+    }
+
+    // Splits a DRM connector name like "DP-2" or "HDMI-A-1" into a
+    // (type, index) pair matching monitor_t's connector fields. Returns
+    // nullopt if the string is not in {type}-{index} form, the type prefix
+    // is unrecognised, the index is zero (DRM connector indices are
+    // 1-based), or the index overflows uint32_t.
+    //
+    // Made externally linkable in test builds so test_kmsgrab.cpp can call
+    // it without needing to mock the surrounding KMS state.
+#ifndef SUNSHINE_TESTS
+    static
+#endif
+      std::optional<std::pair<std::uint32_t, std::uint32_t>>
+      parse_connector_name(std::string_view name) {
+      auto dash = name.find_last_of('-');
+      if (dash == 0 || dash == std::string_view::npos || dash + 1 == name.size()) {
+        return std::nullopt;
+      }
+
+      auto suffix = name.substr(dash + 1);
+      if (!is_all_digits(suffix)) {
+        return std::nullopt;
+      }
+
+      // util::from_view (utility.h) has no overflow guard — its int64
+      // accumulator can wrap on long inputs. Any decimal string up to 18
+      // digits fits safely in int64 (int64 max ≈ 9.22e18, 19 digits), so
+      // capping at 10 is well within the safe range. uint32_max is also
+      // 10 digits (4294967295), so 11+ digits trivially can't represent a
+      // valid index either.
+      if (suffix.size() > 10) {
+        return std::nullopt;
+      }
+
+      auto raw_index = util::from_view(suffix);
+      // Reject 0 (DRM connector indices are 1-based — "DP-0" is not a
+      // real name) and any 10-digit value above uint32_max (e.g. "5000000000").
+      if (raw_index == 0 || raw_index > std::numeric_limits<std::uint32_t>::max()) {
+        return std::nullopt;
+      }
+
+      auto type = from_view_quiet(name.substr(0, dash));
+      if (!type) {
+        return std::nullopt;
+      }
+
+      return std::make_pair(*type, static_cast<std::uint32_t>(raw_index));
+    }
+
+    // Resolution outcome distinguishing "no such connector" from "connector
+    // exists but isn't currently capturable" (powered-off, mid-hotplug),
+    // so resolve_output_name can give the user an accurate error message.
+    enum class find_status_e {
+      not_enumerated,
+      not_active,
+    };
+
+    static std::variant<int, find_status_e>
+      find_monitor_in_descriptors(std::uint32_t type, std::uint32_t index) {
+      bool found_inactive = false;
+      for (const auto &cd : card_descriptors) {
+        for (const auto &[_, mon] : cd.crtc_to_monitor) {
+          if (mon.type != type || mon.index != index) {
+            continue;
+          }
+          if (!mon.active) {
+            // Connector exists but kms_display_names didn't bind a plane
+            // to it. Returning monitor_index here would point at whichever
+            // monitor sits at index 0 (the default-constructed value),
+            // silently misrouting capture — the bug this resolver fixes.
+            found_inactive = true;
+            continue;
+          }
+          return static_cast<int>(mon.monitor_index);
+        }
+      }
+      return found_inactive ? find_status_e::not_active : find_status_e::not_enumerated;
+    }
+
+    // Resolves the user-facing output_name config to the global monitor index
+    // used by display_t::init(). Accepts:
+    //   - empty (selects monitor 0, the documented default-display behavior),
+    //   - a plain numeric index ("0", "1", ...) — historical contract,
+    //   - a DRM connector name ("DP-2", "HDMI-A-1", ...).
+    // Logs a user-facing error and returns -1 on any failure so the caller can
+    // simply propagate the result.
+    //
+    // Made externally linkable in test builds (alongside parse_connector_name).
+#ifndef SUNSHINE_TESTS
+    static
+#endif
+      int resolve_output_name(const std::string &output_name) {
+      if (output_name.empty() || is_all_digits(output_name)) {
+        // INT_MAX has 10 decimal digits. Anything longer can't fit in int and
+        // would wrap util::from_view's int64 accumulator unpredictably; reject
+        // before parsing.
+        if (output_name.size() > 10) {
+          BOOST_LOG(error) << "output_name '"sv << output_name
+                           << "' is out of range for a monitor index."sv;
+          return -1;
+        }
+        auto raw = util::from_view(output_name);
+        if (raw < 0 || raw > std::numeric_limits<int>::max()) {
+          BOOST_LOG(error) << "output_name '"sv << output_name
+                           << "' is out of range for a monitor index."sv;
+          return -1;
+        }
+        return static_cast<int>(raw);
+      }
+
+      auto parsed = parse_connector_name(output_name);
+      if (!parsed) {
+        BOOST_LOG(error) << "output_name '"sv << output_name
+                         << "' is not a valid numeric index or DRM connector "
+                            "name (expected forms: 0, 1, ..., DP-2, HDMI-A-1, ...)."sv;
+        return -1;
+      }
+
+      auto result = find_monitor_in_descriptors(parsed->first, parsed->second);
+      if (auto *idx = std::get_if<int>(&result)) {
+        BOOST_LOG(debug) << "Resolved output_name '"sv << output_name
+                         << "' to monitor index "sv << *idx;
+        return *idx;
+      }
+      switch (std::get<find_status_e>(result)) {
+        case find_status_e::not_active:
+          BOOST_LOG(error) << "output_name '"sv << output_name
+                           << "' refers to a connector that's enumerated but not "
+                              "currently capturable (monitor powered off or mid-hotplug)."sv;
+          break;
+        case find_status_e::not_enumerated:
+          BOOST_LOG(error) << "output_name '"sv << output_name
+                           << "' does not match any connector enumerated on this system."sv;
+          break;
+      }
+      return -1;
     }
 
     class plane_it_t: public round_robin_util::it_wrap_t<plane_t::element_type, plane_it_t> {
@@ -553,10 +778,9 @@ namespace platf {
       std::map<std::uint32_t, monitor_t> result;
 
       for (auto &connector : connectors) {
-        result.emplace(connector.crtc_id, monitor_t {
-                                            connector.type,
-                                            connector.index,
-                                          });
+        // monitor_index, viewport, and active default to zero/false here;
+        // kms_display_names() updates them when it binds a plane to this CRTC.
+        result.emplace(connector.crtc_id, monitor_t {connector.type, connector.index, 0, {}, false});
       }
 
       return result;
@@ -611,7 +835,11 @@ namespace platf {
       int init(const std::string &display_name, const ::video::config_t &config) {
         delay = std::chrono::nanoseconds {1s} / config.framerate;
 
-        int monitor_index = util::from_view(display_name);
+        // resolve_output_name logs a specific error on failure.
+        int monitor_index = resolve_output_name(display_name);
+        if (monitor_index < 0) {
+          return -1;
+        }
         int monitor = 0;
 
         fs::path card_dir {"/dev/dri"sv};
@@ -1666,6 +1894,11 @@ namespace platf {
 
       auto crtc_to_monitor = kms::map_crtc_to_monitor(card.monitors(conn_type_count));
 
+      // Tracks CRTCs whose display_name we've already emitted in this pass.
+      // A CRTC can drive multiple planes (primary + overlay); we want one
+      // entry per monitor, not one per plane.
+      std::set<std::uint32_t> emitted_crtcs;
+
       auto end = std::end(card);
       for (auto plane = std::begin(card); plane != end; ++plane) {
         // Skip unused planes
@@ -1700,7 +1933,14 @@ namespace platf {
         }
 
         auto it = crtc_to_monitor.find(plane->crtc_id);
-        if (it != std::end(crtc_to_monitor)) {
+        const bool first_plane_for_crtc = (it != std::end(crtc_to_monitor)) &&
+                                          emitted_crtcs.find(plane->crtc_id) == emitted_crtcs.end();
+        if (first_plane_for_crtc) {
+          // Only the first plane we see per CRTC sets the viewport,
+          // monitor_index, and the active flag; subsequent overlay planes
+          // for the same CRTC mustn't overwrite (otherwise
+          // resolve_output_name's lookup would point at the overlay, not
+          // the primary surface).
           it->second.viewport = platf::touch_port_t {
             (int) crtc->x,
             (int) crtc->y,
@@ -1708,6 +1948,7 @@ namespace platf {
             (int) crtc->height,
           };
           it->second.monitor_index = count;
+          it->second.active = true;
         }
 
         kms::env_width = std::max(kms::env_width, (int) (crtc->x + crtc->width));
@@ -1715,7 +1956,32 @@ namespace platf {
 
         kms::print(plane.get(), fb.get(), crtc.get());
 
-        display_names.emplace_back(std::to_string(count++));
+        // Emit one entry per monitor (one per CRTC). The DRM connector
+        // name ("DP-2", "HDMI-A-1") is stable and meaningful to users;
+        // for connector types we don't have a canonical name for,
+        // kms::to_string emits the kernel-style "Unknown<N>" form which
+        // round-trips through from_view_quiet. Overlay planes that share
+        // a CRTC with an already-emitted primary don't get a separate
+        // entry. display_t::init() routes both forms through
+        // kms::resolve_output_name, and a legacy numeric output_name
+        // still works via the numeric-as-index fallback in
+        // video::refresh_displays().
+        if (first_plane_for_crtc) {
+          emitted_crtcs.insert(plane->crtc_id);
+          display_names.emplace_back(
+            kms::to_string(it->second.type) + '-' + std::to_string(it->second.index)
+          );
+        } else if (it == std::end(crtc_to_monitor)) {
+          // Driver quirk: this plane references a CRTC that didn't show up
+          // in the connector enumeration. Emit a numeric placeholder so
+          // display_t::init's plane-walk indexing still aligns.
+          display_names.emplace_back(std::to_string(count));
+        }
+
+        // count tracks plane index, not monitor index — display_t::init's
+        // own plane-walking loop counts planes the same way, so this stays
+        // 1:1 with init's `monitor` counter and the resolved index above.
+        ++count;
       }
 
       cds.emplace_back(kms::card_descriptor_t {
