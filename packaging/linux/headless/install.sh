@@ -22,7 +22,7 @@ say "Installer for user $USER_NAME (uid $USER_UID, home $USER_HOME)"
 # ---------- 1. Dependencies ----------
 say "Checking dependencies…"
 missing=()
-for p in python3-evdev python3-pyudev python3-dbus edid-decode; do
+for p in python3-evdev python3-pyudev python3-dbus; do
     rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
 done
 command -v kscreen-doctor >/dev/null || die "kscreen-doctor not found — need Plasma 6.6 or newer"
