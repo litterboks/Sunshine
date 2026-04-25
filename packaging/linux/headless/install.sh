@@ -103,11 +103,24 @@ if [ -f "$SUNSHINE_CONF" ]; then
     say "Backed up existing sunshine.conf"
 fi
 mkdir -p "$(dirname "$SUNSHINE_CONF")"
+
+# Detect the DRM connector the handler will use as the primary virtual.
+# Sunshine (with the linux/kms connector-name patch shipped in this fork)
+# accepts the connector name directly as output_name, so the value stays
+# stable even when monitor enumeration order changes between boots.
+say "Detecting virtual DRM connector…"
+VIRT_CONN="$(sudo /usr/local/bin/sunshine-virt-display-handler print-connector 2>&1)" || {
+    warn "Could not auto-detect a virtual connector: $VIRT_CONN"
+    warn "Falling back to numeric output_name = 1; you can change it later."
+    VIRT_CONN="1"
+}
+say "Using output_name = $VIRT_CONN"
+
 # Add / replace output_name and global_prep_cmd idempotently.
 if grep -q "^output_name" "$SUNSHINE_CONF" 2>/dev/null; then
-    sed -i "s|^output_name.*|output_name = 1|" "$SUNSHINE_CONF"
+    sed -i "s|^output_name.*|output_name = $VIRT_CONN|" "$SUNSHINE_CONF"
 else
-    echo "output_name = 1" >> "$SUNSHINE_CONF"
+    echo "output_name = $VIRT_CONN" >> "$SUNSHINE_CONF"
 fi
 PREP_CMD="global_prep_cmd = [{\"do\":\"$USER_HOME/.local/bin/sunshine-display-setup.sh\",\"undo\":\"$USER_HOME/.local/bin/sunshine-display-teardown.sh\",\"elevated\":\"false\"}]"
 if grep -q "^global_prep_cmd" "$SUNSHINE_CONF"; then

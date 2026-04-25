@@ -39,7 +39,13 @@ DP-3  primary virtual, Plasma renders here, Sunshine captures
 - NVIDIA or any GPU exposing at least one extra DRM connector you can force-activate via debugfs `edid_override` (typically HDMI or DisplayPort ports you're not using)
 - Python packages: `python3-evdev`, `python3-pyudev`, `python3-dbus`
 - `edid-decode`, `git`
-- Sunshine installed (`dev.lizardbyte.app.Sunshine` flatpak or native)
+- **Sunshine with the `linux/kms` connector-name patch** — the installer
+  writes a DRM connector name (e.g. `output_name = DP-2`) into
+  `sunshine.conf`, which only resolves on a Sunshine build that includes
+  the patch from the `fix/linux-kms-connector-name-resolution` branch of
+  this fork. Stock upstream Sunshine treats non-numeric `output_name` as
+  garbage; the installer falls back to `output_name = 1` (with a warning)
+  if connector-name detection fails.
 
 On Bazzite (rpm-ostree), first install deps:
 

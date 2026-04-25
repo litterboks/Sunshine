@@ -604,6 +604,14 @@ def cmd_disconnect(args):
     print("disconnect: done")
 
 
+def cmd_print_connector(_args):
+    """Print the DRM connector name find_virtual_connector() would pick.
+    Used by install.sh to write a stable output_name into sunshine.conf
+    that matches what the handler will use on connect."""
+    conn, _ = find_virtual_connector()
+    print(conn)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -616,6 +624,10 @@ def main():
 
     d = sub.add_parser("disconnect")
     d.set_defaults(func=cmd_disconnect)
+
+    p = sub.add_parser("print-connector",
+                       help="print the DRM connector name find_virtual_connector() would pick")
+    p.set_defaults(func=cmd_print_connector)
 
     args = ap.parse_args()
     args.func(args)
