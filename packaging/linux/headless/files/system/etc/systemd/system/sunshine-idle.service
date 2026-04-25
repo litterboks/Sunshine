@@ -1,0 +1,15 @@
+[Unit]
+Description=Sunshine idle-detection daemon — physical-input only
+After=multi-user.target
+Documentation=file:///usr/local/bin/sunshine-idle-daemon.py
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/sunshine-idle-daemon.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+#!/bin/bash
+# Gracefully end any active Sunshine streaming session before system suspend,
+# and restart Sunshine after resume. Runs inside systemd-suspend.service whose
+# total TimeoutStopSec is bounded — the script is designed to finish in ~12s
+# worst case, falling back to SIGKILL rather than blocking suspend indefinitely.
+
+USER_NAME="{{USER_NAME}}"
+USER_UID="1000"
+SERVICE="app-dev.lizardbyte.app.Sunshine.service"
+TEARDOWN="/var/home/${USER_NAME}/.local/bin/sunshine-display-teardown.sh"
+INHIBIT_PID_FILE="/tmp/sunshine-sleep-inhibit.pid"
+
+AS_USER=(sudo -u "$USER_NAME"
+    "XDG_RUNTIME_DIR=/run/user/${USER_UID}"
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${USER_UID}/bus")
+
+case "$1/$2" in
+    pre/*)
+        if [ -f "$INHIBIT_PID_FILE" ]; then
+            kill "$(cat "$INHIBIT_PID_FILE" 2>/dev/null)" 2>/dev/null
+            rm -f "$INHIBIT_PID_FILE"
+        fi
+
+        if [ -x "$TEARDOWN" ]; then
+            timeout 4s "${AS_USER[@]}" "$TEARDOWN" || true
+        fi
+
+        # Try graceful stop with a hard ceiling, then SIGKILL the cgroup if it hangs.
+        if ! timeout 8s "${AS_USER[@]}" systemctl --user stop "$SERVICE"; then
+            "${AS_USER[@]}" systemctl --user kill --signal=SIGKILL "$SERVICE" 2>/dev/null || true
+            timeout 2s "${AS_USER[@]}" systemctl --user stop "$SERVICE" 2>/dev/null || true
+        fi
+        ;;
+    post/*)
+        "${AS_USER[@]}" systemctl --user start --no-block "$SERVICE" || true
+        ;;
+esac
