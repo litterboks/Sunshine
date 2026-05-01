@@ -107,16 +107,22 @@ def find_virtual_connector() -> tuple[str, Path]:
     """Return (connector_name, debugfs_override_path) for the primary
     virtual.
 
+    "Virtual-eligible" means a connector that has a debugfs
+    edid_override path — that's the mechanism we use to inject an EDID.
+    Whether it's currently connected or disconnected doesn't matter: we
+    write the EDID and kick the connector ourselves either way.
+
     Pick is stable across sessions: consult /run marker first (current
-    run), then /etc persistent file (across reboots). Both are absent on
-    a fresh install — fall back to a heuristic over connectors with
-    debugfs override paths, sorted DP-* first then alphabetical so the
-    choice is at least deterministic given the same hardware.
+    run), then /etc persistent file (across reboots). On a fresh install
+    with neither, fall back to a heuristic that prefers a connector
+    already showing virtual signs (no EDID, or EDID with a virtual
+    marker word) over one with a real monitor's EDID, then DP-* over
+    HDMI-* alphabetically.
     """
     runtime_marker = _read_persistent(MARKER)
     persistent_marker = _read_persistent(PERSISTENT_PRIMARY)
 
-    candidates: list[tuple[str, Path]] = []
+    eligible: list[tuple[str, Path, str, bytes]] = []  # (conn, override, status, edid)
     runtime_match: tuple[str, Path] | None = None
     persistent_match: tuple[str, Path] | None = None
 
@@ -125,36 +131,26 @@ def find_virtual_connector() -> tuple[str, Path]:
         if len(name_parts) != 2:
             continue
         conn = name_parts[1]
+        override = _find_override_path(conn)
+        if override is None:
+            continue
         try:
             status = (drm / "status").read_text().strip()
         except OSError:
-            continue
-        if status != "connected":
-            continue
+            status = "unknown"
         try:
             edid = (drm / "edid").read_bytes()
         except OSError:
             edid = b""
-        override = _find_override_path(conn)
-        if override is None:
-            continue
 
-        # Heuristic: connected with no EDID, OR EDID product name contains
-        # a virtual marker word.
-        is_virtual = not edid
-        if edid and _edid_looks_virtual(edid):
-            is_virtual = True
-        if not is_virtual:
-            continue
-
-        candidates.append((conn, override))
+        eligible.append((conn, override, status, edid))
         if runtime_marker == conn:
             runtime_match = (conn, override)
         if persistent_marker == conn:
             persistent_match = (conn, override)
 
-    if not candidates:
-        sys.exit("No virtual connector found")
+    if not eligible:
+        sys.exit("No virtual-eligible connector found (none with debugfs edid_override)")
 
     if runtime_match:
         chosen = runtime_match
@@ -162,14 +158,25 @@ def find_virtual_connector() -> tuple[str, Path]:
         chosen = persistent_match
         print(f"  primary virtual: persistent marker -> {chosen[0]}")
     else:
-        candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
-        chosen = candidates[0]
-        print(f"  primary virtual: no marker, picking {chosen[0]} from {[c[0] for c in candidates]}")
+        # Heuristic: prefer connectors that are clearly virtual right now
+        # (disconnected, or connected with no real EDID, or with a virtual
+        # marker word). Otherwise we'd risk picking the connector the
+        # user's actual monitor lives on.
+        def looks_virtual(item):
+            conn, _, status, edid = item
+            if status == "disconnected":
+                return True
+            if not edid:
+                return True
+            return _edid_looks_virtual(edid)
 
-    # Persist on first successful pick. Subsequent calls (this run and
-    # next) will see this choice and stay consistent with sunshine.conf's
-    # output_name (which install.sh wrote from print-connector's first
-    # call).
+        virtual_candidates = [item for item in eligible if looks_virtual(item)]
+        if not virtual_candidates:
+            sys.exit("No virtual connector found (all eligible connectors look like real monitors)")
+        virtual_candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
+        chosen = (virtual_candidates[0][0], virtual_candidates[0][1])
+        print(f"  primary virtual: no marker, picking {chosen[0]} from {[c[0] for c in virtual_candidates]}")
+
     if persistent_marker != chosen[0]:
         _write_persistent(PERSISTENT_PRIMARY, chosen[0])
 
