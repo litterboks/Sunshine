@@ -249,13 +249,26 @@ def activate_virtual_as_fallback(conn: str, override_path: Path, width: int, hei
 
 
 def deactivate_virtual(conn: str, override_path: Path) -> None:
-    """Undo activate_virtual_as_fallback: clear EDID override and kick
-    the connector so it goes back to disconnected state."""
+    """Undo activate_virtual_as_fallback: clear EDID override and force
+    a real re-detect so the connector goes back to status=disconnected.
+
+    NOTE: must NOT use kick_connector here — kick_connector ends with
+    `echo on > .../status`, which on NVIDIA forces status=connected even
+    without an EDID source. The result is a connector stuck in
+    "connected/no-EDID" state that can't be a fallback candidate the next
+    time around. `echo detect > .../status` triggers a real probe that
+    correctly reports disconnected when the EDID override is empty.
+    """
     try:
         override_path.write_text("reset")
     except OSError:
         pass
-    kick_connector(conn)
+    for drm in Path("/sys/class/drm").glob(f"card*-{conn}"):
+        try:
+            (drm / "status").write_text("detect")
+        except OSError as e:
+            print(f"  detect kick failed for {conn}: {e}", file=sys.stderr)
+        return
 
 
 def _find_override_path(conn: str) -> Path | None:
@@ -545,9 +558,42 @@ def get_primary_physical_connector(virtual: str) -> str | None:
     return best or sorted(physicals)[0]
 
 
+def _force_detect_unused_virtuals(skip: set[str]) -> None:
+    """Force-detect every connector that has a debugfs override path and
+    isn't in `skip`. Cleans up after a previous session that didn't
+    teardown cleanly — without this, a connector left in
+    "connected/no-EDID" state stays out of the fallback candidate list
+    even though it would be a perfectly good replica target."""
+    for drm in Path("/sys/class/drm").glob("card*-*"):
+        parts = drm.name.split("-", 1)
+        if len(parts) != 2:
+            continue
+        conn = parts[1]
+        if conn in skip:
+            continue
+        if _find_override_path(conn) is None:
+            continue
+        # Only touch connectors that are virtual-eligible (have a debugfs
+        # override path). The physical monitor's connector won't pass that
+        # check.
+        try:
+            (drm / "status").write_text("detect")
+        except OSError:
+            pass
+
+
 def cmd_connect(args):
     ensure_root()
     _log_init(f"connect {args.width}x{args.height}@{args.refresh}")
+
+    # Defensive: force-detect every virtual-eligible connector except the
+    # one we're about to use as primary, so any leftover "connected" state
+    # from an interrupted prior session is reset before we look for a
+    # fallback. The primary connector is skipped because we're about to
+    # write a fresh EDID to it anyway.
+    primary_marker = _read_persistent(MARKER) or _read_persistent(PERSISTENT_PRIMARY)
+    _force_detect_unused_virtuals(skip={primary_marker} if primary_marker else set())
+
     conn, override = find_virtual_connector()
     print(f"connect: virtual connector = {conn}")
     MARKER.write_text(conn)
