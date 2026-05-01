@@ -35,6 +35,68 @@ BASELINE_W, BASELINE_H, BASELINE_R = 640, 480, 60
 MARKER = Path("/run/sunshine-virt-connector")
 FALLBACK_MARKER = Path("/run/sunshine-virt-fallback-connector")
 
+# Persistent (survives reboots) record of the connectors we picked for
+# the primary and fallback virtual roles. /sys/class/drm globs in an
+# undefined order, so without this the heuristic could pick a different
+# connector each session and cause output_name in sunshine.conf to
+# disagree with the connector the handler actually drives.
+PERSISTENT_PRIMARY = Path("/etc/sunshine-headless/primary-connector")
+PERSISTENT_FALLBACK = Path("/etc/sunshine-headless/fallback-connector")
+
+
+def _read_persistent(path: Path) -> str | None:
+    try:
+        v = path.read_text().strip()
+        return v or None
+    except OSError:
+        return None
+
+
+def _write_persistent(path: Path, value: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+    except OSError as e:
+        print(f"  warning: could not persist {path}: {e}", file=sys.stderr)
+
+LOG_FILE = Path("/var/log/sunshine-virt-display-handler.log")
+
+
+def _log_init(subcommand: str) -> None:
+    """Tee stdout + stderr to LOG_FILE so we can debug what the handler did
+    when it was invoked from Sunshine's prep_cmd Do/Undo (Sunshine swallows
+    those streams)."""
+    try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log = open(LOG_FILE, "a", buffering=1)
+    except OSError as e:
+        # Logging is best-effort; never fail the actual operation because
+        # the log file isn't writable.
+        print(f"  warning: could not open {LOG_FILE}: {e}", file=sys.stderr)
+        return
+    import datetime
+    log.write(f"\n=== {datetime.datetime.now().isoformat()} {subcommand} (pid={os.getpid()}) ===\n")
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
+
+
+class _Tee:
+    """Minimal duplicating file wrapper. Each write goes to both streams."""
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
 
 def ensure_root():
     if os.geteuid() != 0:
@@ -42,15 +104,22 @@ def ensure_root():
 
 
 def find_virtual_connector() -> tuple[str, Path]:
-    """Return (connector_name, debugfs_override_path). Uses the marker file
-    if present; otherwise falls back to a detection heuristic."""
-    marked = None
-    try:
-        marked = MARKER.read_text().strip() or None
-    except OSError:
-        pass
+    """Return (connector_name, debugfs_override_path) for the primary
+    virtual.
+
+    Pick is stable across sessions: consult /run marker first (current
+    run), then /etc persistent file (across reboots). Both are absent on
+    a fresh install — fall back to a heuristic over connectors with
+    debugfs override paths, sorted DP-* first then alphabetical so the
+    choice is at least deterministic given the same hardware.
+    """
+    runtime_marker = _read_persistent(MARKER)
+    persistent_marker = _read_persistent(PERSISTENT_PRIMARY)
 
     candidates: list[tuple[str, Path]] = []
+    runtime_match: tuple[str, Path] | None = None
+    persistent_match: tuple[str, Path] | None = None
+
     for drm in Path("/sys/class/drm").glob("card*-*"):
         name_parts = drm.name.split("-", 1)
         if len(name_parts) != 2:
@@ -66,40 +135,67 @@ def find_virtual_connector() -> tuple[str, Path]:
             edid = (drm / "edid").read_bytes()
         except OSError:
             edid = b""
-        # Find the matching debugfs path
         override = _find_override_path(conn)
         if override is None:
             continue
-        if marked == conn:
-            return conn, override
-        # Heuristic fallback: connected but no EDID OR EDID product name
-        # contains a virtual marker word.
+
+        # Heuristic: connected with no EDID, OR EDID product name contains
+        # a virtual marker word.
         is_virtual = not edid
         if edid and _edid_looks_virtual(edid):
             is_virtual = True
-        if is_virtual:
-            candidates.append((conn, override))
+        if not is_virtual:
+            continue
+
+        candidates.append((conn, override))
+        if runtime_marker == conn:
+            runtime_match = (conn, override)
+        if persistent_marker == conn:
+            persistent_match = (conn, override)
 
     if not candidates:
         sys.exit("No virtual connector found")
-    if len(candidates) > 1 and not marked:
-        print(f"  warning: multiple virtual candidates: {[c[0] for c in candidates]}; picking first", file=sys.stderr)
-    return candidates[0]
+
+    if runtime_match:
+        chosen = runtime_match
+    elif persistent_match:
+        chosen = persistent_match
+        print(f"  primary virtual: persistent marker -> {chosen[0]}")
+    else:
+        candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
+        chosen = candidates[0]
+        print(f"  primary virtual: no marker, picking {chosen[0]} from {[c[0] for c in candidates]}")
+
+    # Persist on first successful pick. Subsequent calls (this run and
+    # next) will see this choice and stay consistent with sunshine.conf's
+    # output_name (which install.sh wrote from print-connector's first
+    # call).
+    if persistent_marker != chosen[0]:
+        _write_persistent(PERSISTENT_PRIMARY, chosen[0])
+
+    return chosen
 
 
 def find_fallback_virtual_connector(primary_virtual: str) -> tuple[str, Path] | None:
     """Find a second DRM connector we can use as a fallback virtual (a
     replica of the primary virtual). Any currently-disconnected connector
     with a debugfs edid_override file is a candidate. Returns None if no
-    candidate is available."""
-    # Prefer a previously-configured fallback from the marker file.
-    marked = None
-    try:
-        marked = FALLBACK_MARKER.read_text().strip() or None
-    except OSError:
-        pass
+    candidate is available.
+
+    Connector pick is stable across sessions: we consult /run marker
+    first (current run), then a persistent file under /etc (survives
+    reboots), then fall back to alphabetical sort with DP-* preferred.
+    Without persistent state, two equally-eligible connectors (DP-3 and
+    HDMI-A-1) could be picked inconsistently across reboots — and the
+    teardown code paths assume a stable identity."""
+
+    runtime_marker = _read_persistent(FALLBACK_MARKER)
+    persistent_marker = _read_persistent(PERSISTENT_FALLBACK)
 
     candidates: list[tuple[str, Path]] = []
+    runtime_match: tuple[str, Path] | None = None
+    persistent_match: tuple[str, Path] | None = None
+
     for drm in Path("/sys/class/drm").glob("card*-*"):
         parts = drm.name.split("-", 1)
         if len(parts) != 2:
@@ -116,16 +212,32 @@ def find_fallback_virtual_connector(primary_virtual: str) -> tuple[str, Path] | 
         override = _find_override_path(conn)
         if override is None:
             continue
-        if marked == conn:
-            return conn, override
         candidates.append((conn, override))
+        if runtime_marker == conn:
+            runtime_match = (conn, override)
+        if persistent_marker == conn:
+            persistent_match = (conn, override)
 
     if not candidates:
         return None
-    # Prefer DisplayPort connectors (DP-*) over HDMI so the virtual-display
-    # layer stays on the same physical bus family as the primary virtual.
-    candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
-    return candidates[0]
+
+    # Preference order: this run's marker, then last reboot's marker, then
+    # DP-* alphabetical, then HDMI-* alphabetical.
+    if runtime_match:
+        print(f"  fallback: using /run marker ({runtime_match[0]})")
+        chosen = runtime_match
+    elif persistent_match:
+        print(f"  fallback: using persistent marker ({persistent_match[0]})")
+        chosen = persistent_match
+    else:
+        candidates.sort(key=lambda t: (0 if t[0].startswith("DP-") else 1, t[0]))
+        chosen = candidates[0]
+        print(f"  fallback: no marker, picking {chosen[0]} from {[c[0] for c in candidates]}")
+
+    if persistent_marker != chosen[0]:
+        _write_persistent(PERSISTENT_FALLBACK, chosen[0])
+
+    return chosen
 
 
 def activate_virtual_as_fallback(conn: str, override_path: Path, width: int, height: int, refresh: int) -> None:
@@ -351,6 +463,32 @@ def _output_already_has_mode(conn: str, width: int, height: int) -> bool:
     return False
 
 
+def _is_kscreen_enabled(conn: str) -> bool | None:
+    """True/False from kscreen-doctor's text output for `conn`, or None
+    if we couldn't parse it. Used by cmd_disconnect to verify that the
+    teardown batch actually took effect."""
+    r = as_user("kscreen-doctor", "-o")
+    if r.returncode != 0:
+        return None
+    # Strip ANSI color codes that kscreen-doctor uses for terminal output.
+    import re
+    text = re.sub(r"\x1b\[[0-9;]*m", "", r.stdout)
+    in_section = False
+    for line in text.splitlines():
+        m = re.match(r"^Output:\s+\d+\s+(\S+)", line)
+        if m:
+            in_section = (m.group(1) == conn)
+            continue
+        if not in_section:
+            continue
+        stripped = line.strip()
+        if stripped == "enabled":
+            return True
+        if stripped == "disabled":
+            return False
+    return None
+
+
 def get_preferred_mode_name(conn: str) -> str | None:
     """Return the '<W>x<H>@<R>' string for the preferred mode of conn (its
     native/default resolution), or None if KScreen isn't reachable."""
@@ -409,6 +547,7 @@ def get_primary_physical_connector(virtual: str) -> str | None:
 
 def cmd_connect(args):
     ensure_root()
+    _log_init(f"connect {args.width}x{args.height}@{args.refresh}")
     conn, override = find_virtual_connector()
     print(f"connect: virtual connector = {conn}")
     MARKER.write_text(conn)
@@ -538,6 +677,7 @@ def cmd_connect(args):
 
 def cmd_disconnect(args):
     ensure_root()
+    _log_init("disconnect")
     conn, override = find_virtual_connector()
     print(f"disconnect: virtual connector = {conn}")
 
@@ -592,6 +732,26 @@ def cmd_disconnect(args):
     else:
         print(f"  kscreen teardown ok: {main} -> native, virtuals disabled")
 
+    # Verify the batch actually disabled both virtuals. KWin has been
+    # observed to leave a virtual enabled after a "mirror.none + disable"
+    # batch (presumably a race between processing the two ops). If it
+    # happened, retry the disable in isolation a couple of times.
+    for connector in [c for c in (conn, fb_conn) if c]:
+        for attempt in range(3):
+            still_enabled = _is_kscreen_enabled(connector)
+            if still_enabled is False:
+                break
+            if still_enabled is None:
+                print(f"  could not query kscreen state for {connector}, skipping verify",
+                      file=sys.stderr)
+                break
+            print(f"  {connector} still enabled after batch (attempt {attempt + 1}); "
+                  f"retrying disable", file=sys.stderr)
+            as_user("kscreen-doctor", f"output.{connector}.disable")
+        else:
+            print(f"  ERROR: {connector} stayed enabled after 3 retries — manual cleanup needed",
+                  file=sys.stderr)
+
     # DRM-level cleanup: clear EDID overrides and accumulated custom modes.
     # Done after the kscreen batch so KWin doesn't react to a connector
     # disappearing from sysfs while it's still in its config.
@@ -620,6 +780,7 @@ def cmd_probe_bringup(_args):
     built later by cmd_connect (prep_cmd Do).
     """
     ensure_root()
+    _log_init("probe-bringup")
     conn, override = find_virtual_connector()
     print(f"probe-bringup: virtual connector = {conn}")
     MARKER.write_text(conn)

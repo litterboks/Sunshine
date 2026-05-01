@@ -108,12 +108,18 @@ mkdir -p "$(dirname "$SUNSHINE_CONF")"
 # Sunshine (with the linux/kms connector-name patch shipped in this fork)
 # accepts the connector name directly as output_name, so the value stays
 # stable even when monitor enumeration order changes between boots.
+#
+# print-connector returns just the chosen connector name on stdout; it
+# also persists the choice to /etc/sunshine-headless/primary-connector so
+# subsequent connect/disconnect calls reuse the same connector and stay
+# consistent with output_name in sunshine.conf.
 say "Detecting virtual DRM connector…"
-VIRT_CONN="$(sudo /usr/local/bin/sunshine-virt-display-handler print-connector 2>&1)" || {
-    warn "Could not auto-detect a virtual connector: $VIRT_CONN"
+VIRT_CONN="$(sudo /usr/local/bin/sunshine-virt-display-handler print-connector 2>/dev/null | tail -n 1)"
+if [ -z "$VIRT_CONN" ]; then
+    warn "Could not auto-detect a virtual connector."
     warn "Falling back to numeric output_name = 1; you can change it later."
     VIRT_CONN="1"
-}
+fi
 say "Using output_name = $VIRT_CONN"
 
 # Add / replace output_name and global_prep_cmd idempotently.
