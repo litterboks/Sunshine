@@ -39,6 +39,30 @@
 using namespace std::literals;
 
 namespace nvhttp {
+  namespace {
+    // Run a shell command synchronously and log its outcome. Used to wrap
+    // probe_encoders() with optional pre_probe_cmd / post_probe_cmd hooks.
+    void run_probe_hook(const std::string &label, const std::string &cmd) {
+      if (cmd.empty()) {
+        return;
+      }
+      BOOST_LOG(info) << "Executing " << label << ": [" << cmd << ']';
+      std::error_code ec;
+      boost::process::v1::environment env = boost::this_process::environment();
+      boost::filesystem::path cwd = boost::filesystem::current_path();
+      auto child = platf::run_command(false, true, cmd, cwd, env, nullptr, ec, nullptr);
+      if (ec) {
+        BOOST_LOG(error) << label << " [" << cmd << "] failed to start: " << ec.message();
+        return;
+      }
+      child.wait(ec);
+      if (ec || child.exit_code() != 0) {
+        BOOST_LOG(error) << label << " [" << cmd
+                         << "] exited with code " << child.exit_code();
+      }
+    }
+  }  // namespace
+
 
   static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
 
@@ -877,11 +901,23 @@ namespace nvhttp {
       // change the active displays.
       display_device::configure_display(config::video, *launch_session);
 
+      // Optional pre_probe_cmd: synchronously bring up the capture target
+      // before encoder probing (e.g. a virtual display that only exists
+      // during a stream session). post_probe_cmd is the counterpart and
+      // always runs after the probe — even on failure — so headless setups
+      // can tear down the bring-up state cleanly. Both are no-ops if the
+      // config string is empty.
+      run_probe_hook("pre_probe_cmd"s, config::video.pre_probe_cmd);
+
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
       // or any number of other factors).
-      if (video::probe_encoders()) {
+      auto probe_failed = video::probe_encoders();
+
+      run_probe_hook("post_probe_cmd"s, config::video.post_probe_cmd);
+
+      if (probe_failed) {
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
         tree.put("root.gamesession", 0);
@@ -982,11 +1018,18 @@ namespace nvhttp {
       // change the active displays.
       display_device::configure_display(config::video, *launch_session);
 
+      // See the launch endpoint for the role of pre/post_probe_cmd.
+      run_probe_hook("pre_probe_cmd"s, config::video.pre_probe_cmd);
+
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
       // or any number of other factors).
-      if (video::probe_encoders()) {
+      auto probe_failed = video::probe_encoders();
+
+      run_probe_hook("post_probe_cmd"s, config::video.post_probe_cmd);
+
+      if (probe_failed) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");

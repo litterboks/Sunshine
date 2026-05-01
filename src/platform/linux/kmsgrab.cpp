@@ -41,6 +41,12 @@ namespace fs = std::filesystem;
 
 namespace platf {
 
+  // Forward decl: resolve_output_name() refreshes the card_descriptors cache
+  // on a lookup miss to handle paths like validate_encoder() that call
+  // display_t::init() without going through video::refresh_displays() first
+  // (so the cache from platf::init's initial verify_kms() call may be stale).
+  std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
+
   namespace kms {
 
     class cap_sys_admin {
@@ -450,6 +456,22 @@ namespace platf {
       }
 
       auto result = find_monitor_in_descriptors(parsed->first, parsed->second);
+
+      // On a "not_enumerated" miss, refresh card_descriptors and try once
+      // more. card_descriptors is normally repopulated by
+      // video::refresh_displays() before each capture session, but
+      // probe_encoders() also reaches display_t::init() through
+      // validate_encoder()/reset_display() and skips refresh_displays — so
+      // a fresh /launch with a freshly-injected virtual connector would see
+      // stale state without this retry.
+      if (std::holds_alternative<find_status_e>(result) &&
+          std::get<find_status_e>(result) == find_status_e::not_enumerated) {
+        BOOST_LOG(info) << "output_name '"sv << output_name
+                        << "' not in cached card_descriptors; refreshing..."sv;
+        kms_display_names(mem_type_e::unknown);
+        result = find_monitor_in_descriptors(parsed->first, parsed->second);
+      }
+
       if (auto *idx = std::get_if<int>(&result)) {
         BOOST_LOG(debug) << "Resolved output_name '"sv << output_name
                          << "' to monitor index "sv << *idx;

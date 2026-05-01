@@ -543,46 +543,86 @@ def cmd_disconnect(args):
 
     # Read the fallback virtual marker (set at connect time).
     fb_conn = None
+    fb_override = None
     try:
         fb_conn = FALLBACK_MARKER.read_text().strip() or None
     except OSError:
         pass
-
-    # First break ALL replica bindings — disabling a replica's source while
-    # the binding is still set triggers the KScreen "negative position" bug.
-    main = get_primary_physical_connector(virtual=conn)
-    unmirror_args = [f"output.{conn}.mirror.none"]
     if fb_conn:
-        unmirror_args.append(f"output.{fb_conn}.mirror.none")
-    if main:
-        unmirror_args.append(f"output.{main}.mirror.none")
-        preferred = get_preferred_mode_name(main)
-        if preferred:
-            unmirror_args.append(f"output.{main}.priority.1")
-            unmirror_args.append(f"output.{main}.mode.{preferred}")
-    r = as_user("kscreen-doctor", *unmirror_args)
-    if r.returncode != 0:
-        print(f"  restore apply failed: {r.stderr.strip()}", file=sys.stderr)
-    else:
-        print(f"  restored: {main} -> native, mirrors cleared")
-
-    # Tear down the fallback virtual connector entirely.
-    if fb_conn:
-        as_user("kscreen-doctor", f"output.{fb_conn}.disable")
         fb_override = _find_override_path(fb_conn)
-        if fb_override is not None:
-            deactivate_virtual(fb_conn, fb_override)
-        try:
-            FALLBACK_MARKER.unlink()
-        except OSError:
-            pass
-        print(f"  fallback virtual {fb_conn} torn down")
 
-    # Clean up accumulated custom modes on the primary — they accumulate
-    # across connect/disconnect cycles and eventually confuse the driver's
-    # mode matcher, leading to silent rejection of new clone attempts.
+    main = get_primary_physical_connector(virtual=conn)
+    preferred = get_preferred_mode_name(main) if main else None
+
+    # SPEC.md S0: off-stream is pure Linux — both virtuals fully off, the
+    # physical back at its native mode and priority.
+    #
+    # All teardown commands go in a SINGLE kscreen-doctor invocation so KWin
+    # applies them atomically. Splitting them across multiple invocations
+    # gave KWin a window to re-enable the fallback virtual standalone after
+    # its mirror source was removed but before the disable was applied,
+    # leaving DP-3 enabled at 1024x768 in S0.
+    #
+    # Order within the batch:
+    #   1. Break every replica binding first — disabling a replica's source
+    #      while the binding is still set triggers a KScreen layout bug
+    #      ("negative position").
+    #   2. Disable both virtuals.
+    #   3. Restore the physical to priority 1 at its native mode.
+    teardown_args = [
+        f"output.{conn}.mirror.none",
+    ]
+    if fb_conn:
+        teardown_args.append(f"output.{fb_conn}.mirror.none")
+    if main:
+        teardown_args.append(f"output.{main}.mirror.none")
+
+    teardown_args.append(f"output.{conn}.disable")
+    if fb_conn:
+        teardown_args.append(f"output.{fb_conn}.disable")
+
+    if main:
+        teardown_args.append(f"output.{main}.priority.1")
+        if preferred:
+            teardown_args.append(f"output.{main}.mode.{preferred}")
+
+    r = as_user("kscreen-doctor", *teardown_args)
+    if r.returncode != 0:
+        print(f"  kscreen teardown failed: {r.stderr.strip()}", file=sys.stderr)
+    else:
+        print(f"  kscreen teardown ok: {main} -> native, virtuals disabled")
+
+    # DRM-level cleanup: clear EDID overrides and accumulated custom modes.
+    # Done after the kscreen batch so KWin doesn't react to a connector
+    # disappearing from sysfs while it's still in its config.
+    deactivate_virtual(conn, override)
+    if fb_conn and fb_override is not None:
+        deactivate_virtual(fb_conn, fb_override)
     if main:
         cleanup_custom_modes(main)
+
+    for marker in (MARKER, FALLBACK_MARKER):
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+    print("disconnect: done (S0)")
+
+
+def cmd_probe_bringup(_args):
+    """Lightweight bring-up for Sunshine's encoder probe.
+
+    Injects a baseline EDID, kicks the connector, and enables it in
+    kscreen — but does NOT build any mirror topology. Just enough state
+    for kms_display_names() to enumerate DP-1 so probe_encoders() can
+    create an encoder against it. The full client-resolution topology is
+    built later by cmd_connect (prep_cmd Do).
+    """
+    ensure_root()
+    conn, override = find_virtual_connector()
+    print(f"probe-bringup: virtual connector = {conn}")
+    MARKER.write_text(conn)
 
     edid = create_edid(
         width=BASELINE_W,
@@ -591,17 +631,14 @@ def cmd_disconnect(args):
         display_name=VIRTUAL_EDID_NAME,
     )
     write_override(override, edid)
-    print(f"  baseline EDID restored ({BASELINE_W}x{BASELINE_H}@{BASELINE_R})")
     kick_connector(conn)
     ok = wait_for_mode(conn, BASELINE_W, BASELINE_H)
     print(f"  connector kicked, mode exposed = {ok}")
 
-    r = as_user("kscreen-doctor",
-                f"output.{conn}.enable",
-                f"output.{conn}.mode.{BASELINE_W}x{BASELINE_H}@{BASELINE_R}")
+    r = as_user("kscreen-doctor", f"output.{conn}.enable")
     if r.returncode != 0:
-        print(f"  kscreen baseline apply failed: {r.stderr.strip()}", file=sys.stderr)
-    print("disconnect: done")
+        print(f"  kscreen enable failed: {r.stderr.strip()}", file=sys.stderr)
+    print("probe-bringup: done")
 
 
 def cmd_print_connector(_args):
@@ -624,6 +661,10 @@ def main():
 
     d = sub.add_parser("disconnect")
     d.set_defaults(func=cmd_disconnect)
+
+    pb = sub.add_parser("probe-bringup",
+                        help="enable virtual at baseline EDID for Sunshine's encoder probe")
+    pb.set_defaults(func=cmd_probe_bringup)
 
     p = sub.add_parser("print-connector",
                        help="print the DRM connector name find_virtual_connector() would pick")

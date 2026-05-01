@@ -129,6 +129,18 @@ else
     echo "$PREP_CMD" >> "$SUNSHINE_CONF"
 fi
 
+# pre_probe_cmd: brings the virtual up at baseline EDID just before
+# Sunshine probes encoders on /launch. Without this, probe_encoders()
+# can't see DP-N because the connector is fully torn down between
+# streams (SPEC.md S0). prep_cmd Do still runs afterwards to switch
+# the virtual to the actual client resolution and build the topology.
+PRE_PROBE_CMD="pre_probe_cmd = sudo /usr/local/bin/sunshine-virt-display-handler probe-bringup"
+if grep -q "^pre_probe_cmd" "$SUNSHINE_CONF"; then
+    sed -i "s|^pre_probe_cmd.*|$PRE_PROBE_CMD|" "$SUNSHINE_CONF"
+else
+    echo "$PRE_PROBE_CMD" >> "$SUNSHINE_CONF"
+fi
+
 # ---------- 8. Reload systemd + enable services ----------
 say "Reloading systemd and enabling services…"
 sudo systemctl daemon-reload

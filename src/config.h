@@ -96,6 +96,8 @@ namespace config {
     std::string encoder;
     std::string adapter_name;
     std::string output_name;
+    std::string pre_probe_cmd;
+    std::string post_probe_cmd;
 
     struct dd_t {
       struct workarounds_t {
